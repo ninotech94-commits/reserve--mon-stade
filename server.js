@@ -160,7 +160,17 @@ function validSlot(slot) {
 }
 
 function normalizeAdminDate(value) {
-  const date = String(value ?? "").trim();
+  // node-postgres peut renvoyer une colonne DATE sous forme de Date selon
+  // le parseur configuré. On la normalise en date ISO UTC, sans décalage local.
+  let date;
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    date = `${value.getUTCFullYear()}-${String(value.getUTCMonth() + 1).padStart(2, "0")}-${String(value.getUTCDate()).padStart(2, "0")}`;
+  } else {
+    date = String(value ?? "").trim();
+    // Accepte aussi un timestamp ISO en entrée, en conservant sa partie date.
+    const iso = date.match(/^(\d{4}-\d{2}-\d{2})(?:$|T|\s)/);
+    if (iso) date = iso[1];
+  }
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
   const [year, month, day] = date.split("-").map(Number);
   const parsed = new Date(Date.UTC(year, month - 1, day));
@@ -754,7 +764,7 @@ app.post("/api/bookings", async (req, res) => {
  */
 app.post("/api/slot-locks", async(req,res)=>{const dates=normalizeDates(req.body?.dates),slots=bookingSlots({slots:req.body?.slots}),token=String(req.body?.token||"").slice(0,100);if(!dates.length||!slots.length||!token)return res.status(400).json({error:"Dates, créneaux et jeton requis."});const client=await pool.connect();try{await client.query("BEGIN");for(const date of dates)for(const slot of slots)await client.query("SELECT pg_advisory_xact_lock(hashtext($1))",[`${date}|${slot}`]);const occupied=await client.query(`SELECT 1 FROM booking_slot_locks WHERE booking_date=ANY($1::date[]) AND slot=ANY($2::text[]) AND (manually_closed=TRUE OR (lock_token IS NOT NULL AND expires_at>NOW() AND lock_token<>$3)) LIMIT 1`,[dates,slots,token]);const booked=await client.query(`SELECT 1 FROM bookings b CROSS JOIN LATERAL jsonb_array_elements_text(b.dates) d(date) CROSS JOIN LATERAL unnest(string_to_array(b.slot,' || ')) s(slot) WHERE b.status='confirmed' AND d.date=ANY($1::text[]) AND s.slot=ANY($2::text[]) LIMIT 1`,[dates,slots]);if(occupied.rowCount||booked.rowCount){await client.query("ROLLBACK");return res.status(409).json({error:"Un des créneaux vient d’être réservé ou fermé."});}for(const date of dates)for(const slot of slots)await client.query(`INSERT INTO booking_slot_locks(booking_date,slot,lock_token,expires_at,manually_closed) VALUES($1,$2,$3,NOW()+INTERVAL '15 minutes',FALSE) ON CONFLICT(booking_date,slot) DO UPDATE SET lock_token=EXCLUDED.lock_token,expires_at=EXCLUDED.expires_at WHERE booking_slot_locks.manually_closed=FALSE AND (booking_slot_locks.expires_at IS NULL OR booking_slot_locks.expires_at<=NOW() OR booking_slot_locks.lock_token=$3)`,[date,slot,token]);await client.query("COMMIT");res.json({ok:true,expiresIn:900});}catch(e){try{await client.query("ROLLBACK")}catch{}dbError(res,e,"Impossible de verrouiller les créneaux.")}finally{client.release()}});
 app.delete("/api/slot-locks",async(req,res)=>{try{await pool.query("DELETE FROM booking_slot_locks WHERE lock_token=$1 AND manually_closed=FALSE",[String(req.body?.token||"").slice(0,100)]);res.json({ok:true})}catch(e){dbError(res,e,"Impossible de libérer les créneaux.")}});
-app.get("/api/admin/slot-locks",adminAuth,async(req,res)=>{res.set("Cache-Control","no-store, no-cache, must-revalidate, proxy-revalidate");res.set("Pragma","no-cache");res.set("Expires","0");try{const r=await pool.query("SELECT booking_date,slot FROM booking_slot_locks WHERE manually_closed=TRUE ORDER BY booking_date,slot");res.json({closures:r.rows.map(x=>({date:String(x.booking_date).slice(0,10),slot:x.slot}))})}catch(e){dbError(res,e,"Impossible de charger les créneaux fermés.")}});
+app.get("/api/admin/slot-locks",adminAuth,async(req,res)=>{res.set("Cache-Control","no-store, no-cache, must-revalidate, proxy-revalidate");res.set("Pragma","no-cache");res.set("Expires","0");try{const r=await pool.query("SELECT to_char(booking_date, 'YYYY-MM-DD') AS date,slot FROM booking_slot_locks WHERE manually_closed=TRUE ORDER BY booking_date,slot");res.json({closures:r.rows.map(x=>({date:normalizeAdminDate(x.date),slot:normalizeSlot(String(x.slot||""))||String(x.slot||"")}))})}catch(e){dbError(res,e,"Impossible de charger les créneaux fermés.")}});
 app.post("/api/admin/slot-locks",adminAuth,async(req,res)=>{res.set("Cache-Control","no-store, no-cache, must-revalidate, proxy-revalidate");res.set("Pragma","no-cache");res.set("Expires","0");const date=normalizeAdminDate(req.body?.date),slot=normalizeSlot(String(req.body?.slot||"")),closed=req.body?.closed===true||req.body?.closed==="true";if(!date||!slot)return res.status(400).json({error:"Date ou créneau invalide."});try{if(closed)await pool.query(`INSERT INTO booking_slot_locks(booking_date,slot,manually_closed,lock_token,expires_at) VALUES($1,$2,TRUE,NULL,NULL) ON CONFLICT(booking_date,slot) DO UPDATE SET manually_closed=TRUE,lock_token=NULL,expires_at=NULL`,[date,slot]);else await pool.query("DELETE FROM booking_slot_locks WHERE booking_date=$1 AND (slot=$2 OR regexp_replace(slot, '\\s+', ' ', 'g')=regexp_replace($2, '\\s+', ' ', 'g')) AND manually_closed=TRUE",[date,slot]);res.json({ok:true})}catch(e){dbError(res,e,"Impossible de modifier le créneau.")}});
 
 app.post("/api/admin/login", async (req,res) => {
