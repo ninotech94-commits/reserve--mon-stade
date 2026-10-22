@@ -534,7 +534,7 @@ function datesForMonth(month,weekday){
  return out;
 }
 function isBooked(date,slot){return serverBookings.some(b=>(Array.isArray(b.slots)?b.slots:String(b.slot||"").split(" || ")).includes(slot)&&b.dates?.includes(date))}
-function isClosed(date,slot){return serverClosed.some(b=>b.date===date&&b.slot===slot)}
+function isClosed(date,slot){return serverClosed.some(b=>String(b.date).slice(0,10)===date&&String(b.slot||"").trim().replace(/[–—]/g,"-").replace(/\s+/g," ")===String(slot||"").trim().replace(/[–—]/g,"-").replace(/\s+/g," "))}
 function datesForCurrent(){return bookingType==="monthly"?datesForMonth($("month").value,$("weekday").value):[$("date").value]}
 function renderSlots(){
  const dates=datesForCurrent();
